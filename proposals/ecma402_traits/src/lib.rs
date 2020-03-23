@@ -56,6 +56,26 @@ pub trait LanguageIdentifier {
     fn script(&self) -> Option<&str>;
 }
 
+/// Traits that ended up being unusual or weird because of issues unrelated to their structure.
+/// Specifically [weird::Variants] departs from what it should have been because of issues with
+/// defining a lifetime of an iterator.
+pub mod weird {
+
+    /// Variants allow iteration over variants, regardless of whether they are returned as owned or
+    /// not.  See `mod tests` below for example implementations.  [Variants] needs to be
+    /// implemented on a reference to the container type, not the type itself, in order for the
+    /// iterator to have the correct lifetime.
+    pub trait Variants {
+        /// The type of the item yieled by the iterator returned by [Variants::variants].  Note
+        /// that [Variants::Item] may be a reference to the type stored in the iterator.  See tests
+        /// for the details.
+        type Item;
+        /// The type of the iterator returned by [Variants::variants].
+        type Iter: ExactSizeIterator<Item = Self::Item>;
+        fn variants(self) -> Self::Iter;
+    }
+}
+
 /// Allows representing the item (a locale object or a language identifier) in the form compatible
 /// with the [BCP 47 representation](https://tools.ietf.org/html/bcp47).
 pub trait AsBCP47 {
@@ -66,99 +86,139 @@ pub trait AsBCP47 {
     fn as_bcp47(&self) -> &str;
 }
 
-/// Traits that ended up being unusual or weird because of issues unrelated to their structure.
-/// Specifically [weird::Variants] departs from what it should have been because of issues with
-/// defining a lifetime of an iterator.
-pub mod weird {
-
-    /// Allows access to variants.  Variants are guaranteed to be valid.
-    ///
-    /// What I had wanted originally is something that returns an iterator; but it turns out that
-    /// it's quite involved to do so in rust today.  One would probably want to use an
-    /// [ExactSizeIterator] for this purpose, but it turns out that it is very involved to define
-    /// specifically a trait that establishes the lifetime relationships between the elements, the
-    /// iterator itself and the [Variants].  So I didn't, and instead provided the needed functions
-    /// here.  An `has_variants` predicate is absent because it's equivalent to
-    /// `num_variants()==0`, and calling `num_variants()` should not require counting.
-    pub trait Variants {
-        /// Returns an integer representing the number of variants defined in this language
-        /// identifier.
-        fn num_variants(&self) -> usize;
-
-        /// Calls `for_each` on each variant defined, and passes each one in turn
-        /// to it.  Iteration order is random.  An example use is given below.  Care
-        /// must be taken not to rely on any specific iteration order.
-        ///
-        /// ``` ignore
-        /// let mut variants = HashSet::new();
-        /// id.for_each_variant(|s| {
-        ///     variants.insert(s.to_string());
-        /// });
-        /// ```
-        fn for_each_variant(&self, for_each: impl FnMut(&str));
-    }
+/// This trait corresponds to the `Intl` object of ECMA-402.
+pub trait Intl {
+    /// Canonicalizes all locale names that were passed in.
+    fn get_canonical_locales(&self, locales: &Vec<impl AsRef<[u8]>>) -> Vec<String>;
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::weird::Variants;
-    use crate::LanguageIdentifier;
-    use std::collections::HashSet;
+    use crate::{LanguageIdentifier, weird::Variants};
 
-    /// This is a sample implementation of the [Identifier] trait.  The static
-    /// lifetimes of the components are chosen because it makes the tests short,
-    /// but any internal implementation works.
-    struct TestID {
-        language: &'static str,
-        region: Option<&'static str>,
-        script: Option<&'static str>,
-        variants: Vec<&'static str>,
+    /// Here's an example struct that implements [LanguageIdentifier] and [Variants] traits, and
+    /// borrows all of its constituent elements.  Also, fields can't have the same names as
+    /// trait methods.
+    #[derive(Debug)]
+    struct BorrowedId {
+        lang: &'static str,
+        reg: Option<&'static str>,
+        scr: Option<&'static str>,
+        var: Vec<&'static str>,
     }
-    impl LanguageIdentifier for TestID {
+    impl LanguageIdentifier for BorrowedId {
         fn language(&self) -> &str {
-            self.language
+            self.lang
         }
         fn region(&self) -> Option<&str> {
-            self.region
+            self.reg
         }
         fn script(&self) -> Option<&str> {
-            self.script
+            self.scr
         }
     }
-
-    impl Variants for TestID {
-        fn num_variants(&self) -> usize {
-            self.variants.len()
-        }
-
-        fn for_each_variant(&self, mut for_each: impl FnMut(&str)) {
-            self.variants.iter().map(|s| for_each(s)).for_each(drop);
+    impl<'a> Variants for &'a BorrowedId {
+        type Item = &'a &'a str;
+        type Iter = std::slice::Iter<'a, &'a str>;
+        fn variants(self) -> Self::Iter {
+            self.var.iter()
         }
     }
 
     #[test]
-    fn return_components() {
-        let id = TestID {
-            language: "en",
-            region: Some("US"),
-            script: None,
+    fn borrowed_tests() {
+        let id = BorrowedId {
+            lang: "en",
+            reg: Some("US"),
+            scr: None,
             // Note the variants in this example are not valid.
-            variants: vec!["east_coast", "west_coast"],
+            var: vec!["east_coast", "west_coast"],
         };
         assert_eq!(id.language(), "en");
         assert_eq!(id.region(), Some("US"));
         assert_eq!(id.script(), None);
+        assert_eq!(id.variants().next().unwrap(), &"east_coast");
+        assert_eq!(
+            id.variants()
+                .map(|v| v.to_owned().to_owned())
+                .collect::<Vec<String>>(),
+            vec!["east_coast", "west_coast"]
+        );
+    }
 
-        let mut variants = HashSet::new();
-        id.for_each_variant(|s| {
-            variants.insert(s.to_string());
-        });
+    /// Here's an example struct that implements [LanguageIdentifier] and [Variants] traits, and
+    /// owns all its constituent elements.
+    struct OwnedId {
+        lang: String,
+        reg: Option<String>,
+        scr: Option<String>,
+        var: Vec<String>,
+    }
+    impl LanguageIdentifier for OwnedId {
+        fn language(&self) -> &str {
+            &self.lang
+        }
+        fn region(&self) -> Option<&str> {
+            self.reg.as_deref()
+        }
+        fn script(&self) -> Option<&str> {
+            self.scr.as_deref()
+        }
+    }
+    impl<'a> Variants for &'a OwnedId {
+        type Item = &'a String;
+        type Iter = std::slice::Iter<'a, String>;
+        fn variants(self) -> Self::Iter {
+            self.var.iter()
+        }
+    }
 
-        // Iteration order is unspecified.
-        let expected: HashSet<String> = ["west_coast", "east_coast"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(variants, expected);
+    #[test]
+    fn owned_tests() {
+        let id = OwnedId {
+            lang: "en".to_string(),
+            reg: Some("US".to_string()),
+            scr: None,
+            // Note the variants in this example are not valid.
+            var: vec!["east_coast".to_string(), "west_coast".to_string()],
+        };
+        assert_eq!(id.language(), "en");
+        assert_eq!(id.region(), Some("US"));
+        assert_eq!(id.script(), None);
+        assert_eq!(
+            id.variants()
+                .map(|v| v.to_owned())
+                .collect::<Vec<String>>(),
+            vec!["east_coast", "west_coast"]
+        );
+    }
+
+
+    use crate::Intl;
+
+    struct IntlImpl {}
+
+    impl Intl for IntlImpl {
+        // This is a fake implementation that just illustrates how locales get
+        // transformed by passing through the filter.  Locales may be non-utf8, which is
+        // why the method admits anything that can be represented as a sequence of bytes.
+        fn get_canonical_locales(&self, locales: &Vec<impl AsRef<[u8]>>) -> Vec<String> {
+            locales
+                .iter()
+                // A real library would not enforce UTF-8, but would consider the possibility that
+                // the locale passed in is using a different encoding than UTF-8.
+                .map(|l| std::str::from_utf8(l.as_ref()).expect("can not be converted to utf8"))
+                // Shows how locales can be omitted from the result.
+                .filter(|l| *l != "skip")
+                .map(|l| format!("canonicalized({})", l))
+                .collect::<Vec<String>>()
+        }
+    }
+
+    #[test]
+    fn test_canonical_locales() {
+        let i = IntlImpl {};
+        let c = i.get_canonical_locales(&vec!["en-us", "skip", "fr-fr"]);
+        assert_eq!(c, vec!["canonicalized(en-us)", "canonicalized(fr-fr)"]);
     }
 }
